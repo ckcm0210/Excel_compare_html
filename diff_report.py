@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Excel 檔案變更歷程報告 - 具備 Worksheet 配對狀態概覽與全方位外部參照路徑還原功能
-"""
 import os
 import json
 import warnings
@@ -27,14 +23,14 @@ def get_excel_metadata(file_path):
     
     author = "Unknown"
     try:
-        wb = openpyxl.load_workbook(file_path, read_only=True)
+        wb = openpyxl.load_workbook(file_path, data_only=True)
         if hasattr(wb.properties, 'lastModifiedBy') and wb.properties.lastModifiedBy:
             author = wb.properties.lastModifiedBy
         elif wb.properties.creator:
             author = wb.properties.creator
         wb.close()
     except Exception:
-        author = "無法讀取"
+        author = "Unable to read"
         
     return author, last_modified_date
 
@@ -181,9 +177,8 @@ def generate_diff_report(old_data, new_data, old_file_path, new_file_path, outpu
         output_dir = os.path.join(DEFAULT_LOG_FOLDER, 'diff_reports')
     os.makedirs(output_dir, exist_ok=True)
     
-    diff_data = prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_unchanged_cells=include_unchanged_cells)
+    diff_data = prepare_diff_data(old_data, new_data, old_file_path, new_file_path)
     
-    # 提取 Worksheet 配對狀態數據
     old_sheets = set(old_data.keys())
     new_sheets = set(new_data.keys())
     matched_sheets = sorted(list(old_sheets & new_sheets))
@@ -196,7 +191,7 @@ def generate_diff_report(old_data, new_data, old_file_path, new_file_path, outpu
         "newOnly": new_only_sheets
     }
     
-    html_content = generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path)
+    html_content = generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path, include_unchanged_cells)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     new_filename = os.path.basename(new_file_path.strip('"'))
@@ -207,14 +202,20 @@ def generate_diff_report(old_data, new_data, old_file_path, new_file_path, outpu
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
     
-    print(f"[diff-report] 報告已生成: {output_path}")
+    print(f"[diff-report] Report generated: {output_path}")
     return output_path
 
-def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_unchanged_cells=False):
-    all_sheets = set(old_data.keys()) & set(new_data.keys()) # 只對比共同擁有的 worksheets 避免 KeyError
+def prepare_diff_data(old_data, new_data, old_file_path, new_file_path):
+    old_sheets_set = set(old_data.keys())
+    new_sheets_set = set(new_data.keys())
+    all_sheets = old_sheets_set | new_sheets_set
     change_items = []
     
     for sheet_name in all_sheets:
+        is_matched = (sheet_name in old_sheets_set and sheet_name in new_sheets_set)
+        is_old_only = (sheet_name in old_sheets_set and sheet_name not in new_sheets_set)
+        is_new_only = (sheet_name not in old_sheets_set and sheet_name in new_sheets_set)
+        
         old_sheet = old_data.get(sheet_name, {})
         new_sheet = new_data.get(sheet_name, {})
         all_addresses = set(old_sheet.keys()) | set(new_sheet.keys())
@@ -228,22 +229,29 @@ def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_
             old_formula = old_cell.get('formula', '')
             new_formula = new_cell.get('formula', '')
             
-            has_diff = (old_cell != new_cell)
-            
-            if not include_unchanged_cells and not has_diff:
-                continue
-            
             val_diff_str = ""
-            try:
-                if str(old_val).strip() == "" and str(new_val).strip() != "":
-                    val_diff_str = str(float(new_val))
-                elif str(old_val) != "" and str(new_val) != "":
-                    diff_val = float(new_val) - float(old_val)
-                    if diff_val != 0:
+            has_diff = False
+            
+            if is_old_only:
+                has_diff = True
+            elif is_new_only:
+                has_diff = True
+            else:
+                has_diff = (old_cell != new_cell)
+                
+                try:
+                    if str(old_val).strip() == "" and str(new_val).strip() != "":
+                        val_diff_str = str(float(new_val))
+                    elif str(old_val).strip() != "" and str(new_val).strip() == "":
+                        diff_val = 0.0 - float(old_val)
                         val_diff_str = str(diff_val)
-            except (ValueError, TypeError):
-                if old_val != new_val:
-                    val_diff_str = f"{old_val} -> {new_val}"
+                    elif str(old_val) != "" and str(new_val) != "":
+                        diff_val = float(new_val) - float(old_val)
+                        if diff_val != 0:
+                            val_diff_str = str(diff_val)
+                except (ValueError, TypeError):
+                    if old_val != new_val:
+                        val_diff_str = f'<span class="diff-deleted">{old_val}</span> <strong>-></strong> <span class="diff-added">{new_val}</span>'
             
             change_items.append({
                 'sheet': sheet_name,
@@ -253,7 +261,9 @@ def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_
                 'valDiff': val_diff_str,
                 'oldFormula': old_formula,
                 'newFormula': new_formula,
-                'hasDiff': has_diff
+                'hasDiff': has_diff,
+                'isOldOnly': is_old_only,
+                'isNewOnly': is_new_only
             })
                 
     timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -270,7 +280,7 @@ def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_
     }
     return [file_entry]
 
-def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
+def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path, include_unchanged_cells):
     json_data = json.dumps(diff_data, ensure_ascii=False).replace("</script>", "<\\/script>")
     sheet_meta_json = json.dumps(sheet_meta, ensure_ascii=False)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -287,11 +297,28 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
     old_url = f"file:///{old_path_safe}"
     new_url = f"file:///{new_path_safe}"
     
+    if include_unchanged_cells:
+        unchanged_checkbox_html = """
+                <div>
+                    <label style="cursor: pointer; font-weight: bold; display: inline-flex; align-items: center; gap: 5px;">
+                        <input type="checkbox" id="showUnchanged" onchange="onFilterChange()" checked> Show Unchanged & Unpaired
+                    </label>
+                </div>"""
+        include_unchanged_js_flag = "true"
+    else:
+        unchanged_checkbox_html = """
+                <div>
+                    <label style="cursor: pointer; font-weight: bold; display: inline-flex; align-items: center; gap: 5px;">
+                        <input type="checkbox" id="showUnchanged" onchange="onFilterChange()"> Show Unchanged & Unpaired
+                    </label>
+                </div>"""
+        include_unchanged_js_flag = "false"
+    
     html_template = r"""<!DOCTYPE html>
-<html lang="zh-Hant">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Excel 檔案變更歷程報告</title>
+    <title>Excel Difference History Report</title>
     <style>
         :root {
             --bg-color: #000000;
@@ -373,7 +400,6 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             color: var(--btn-hover-color);
         }
 
-        /* Worksheet 配對狀態概覽專用樣式 */
         .sheet-status-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -411,6 +437,7 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             margin-top: 10px;
             background-color: var(--bg-color);
             border: 1px solid var(--border-color);
+            table-layout: fixed;
         }
         th, td {
             border: 1px solid var(--border-color);
@@ -421,6 +448,8 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             color: var(--text-color);
             word-break: break-all;
             white-space: pre-wrap;
+            overflow: hidden;
+            position: relative;
         }
         th { 
             background-color: var(--header-bg); 
@@ -433,10 +462,35 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             background-color: var(--border-color);
             color: var(--bg-color);
         }
-        th:nth-child(1), td:nth-child(1) { min-width: 160px; }
-        th:nth-child(2), td:nth-child(2) { white-space: nowrap; min-width: 70px; }
-        .diff-added { background-color: var(--added-bg); color: var(--added-color); padding: 1px 2px; }
-        .diff-deleted { background-color: var(--deleted-bg); color: var(--deleted-color); text-decoration: line-through; padding: 1px 2px; }
+
+        .resizer {
+            position: absolute;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            width: 6px;
+            cursor: col-resize;
+            user-select: none;
+            z-index: 10;
+        }
+        .resizer:hover, th.resizing .resizer, td.resizing .resizer {
+            background-color: var(--link-color);
+        }
+
+        th:nth-child(1), td:nth-child(1) { width: 150px; }
+        th:nth-child(2), td:nth-child(2) { width: 80px; }
+        th:nth-child(3), td:nth-child(3) { width: 140px; }
+        th:nth-child(4), td:nth-child(4) { width: 140px; }
+        th:nth-child(5), td:nth-child(5) { width: 140px; }
+        th:nth-child(6), td:nth-child(6) { width: 180px; }
+        th:nth-child(7), td:nth-child(7) { width: 180px; }
+        th:nth-child(8), td:nth-child(8) { width: 200px; }
+
+        .diff-added { background-color: var(--added-bg); color: var(--added-color); padding: 1px 2px; border-radius: 2px; }
+        .diff-deleted { background-color: var(--deleted-bg); color: var(--deleted-color); padding: 1px 2px; border-radius: 2px; }
+        /* 專門畀 Formula Comparison 用嘅刪除線樣式 */
+        .formula-deleted { background-color: var(--deleted-bg); color: var(--deleted-color); text-decoration: line-through; padding: 1px 2px; border-radius: 2px; }
+        
         .header-row {
             display: flex;
             justify-content: space-between;
@@ -444,55 +498,68 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             flex-wrap: wrap;
             gap: 10px;
         }
+        
+        .pagination-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: var(--header-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body data-theme="hacker">
 
-    <h1>Excel 檔案變更歷程報告</h1>
+    <h1>Excel Difference History Report</h1>
     
     <div class="file-info">
         <div>
-            <strong>📂 舊版檔案 (Old):</strong> <a href="__OLDURL__" target="_blank" class="file-link">__OLDFILEPATH__</a>
-            <div class="meta-text">👤 上次存檔者: __OLD_AUTHOR__ &nbsp;|&nbsp; 🕒 最後修改: __OLD_MOD__</div>
+            <strong>Old File:</strong> <a href="__OLDURL__" target="_blank" class="file-link">__OLDFILEPATH__</a>
+            <div class="meta-text">Last Modified By: __OLD_AUTHOR__ &nbsp;|&nbsp; Last Modified: __OLD_MOD__</div>
         </div>
         <div>
-            <strong>📂 新版檔案 (New):</strong> <a href="__NEWURL__" target="_blank" class="file-link">__NEWFILEPATH__</a>
-            <div class="meta-text">👤 上次存檔者: __NEW_AUTHOR__ &nbsp;|&nbsp; 🕒 最後修改: __NEW_MOD__</div>
+            <strong>New File:</strong> <a href="__NEWURL__" target="_blank" class="file-link">__NEWFILEPATH__</a>
+            <div class="meta-text">Last Modified By: __NEW_AUTHOR__ &nbsp;|&nbsp; Last Modified: __NEW_MOD__</div>
         </div>
     </div>
 
-    <!-- 🌟 工作表配對狀態概覽區塊 -->
     <div class="section-box" style="border-left: 4px solid var(--border-color);">
-        <h3>📌 工作表 (Worksheet) 配對狀態概覽</h3>
-        <p class="meta-text" style="margin-bottom: 8px;">系統會自動配對雙方皆存在的工作表進行比較；名稱不相符或僅單邊存在的表將無法進行儲存格差異對比。</p>
+        <h3>Worksheet Status Overview</h3>
+        <p class="meta-text" style="margin-bottom: 8px;">Clicking any sheet badge below will filter the view directly. Unpaired sheets (Old Only / New Only) require the checkbox below to be enabled.</p>
         
-        <div class="sheet-status-grid" id="sheetStatusContainer">
-            <!-- 動態填入 -->
-        </div>
+        <div class="sheet-status-grid" id="sheetStatusContainer"></div>
     </div>
 
     <div class="file-info">
         <div style="border-top: 1px dashed var(--border-color); padding-top: 8px;" class="header-row">
             <div>
-                <strong>⏱️ 報告生成時間:</strong> <span>__TIMESTAMP__</span><br>
-                <div id="summary" style="margin-top: 4px;"><strong>總變更數:</strong> 載入中...</div>
+                <strong>Generated At:</strong> <span>__TIMESTAMP__</span><br>
+                <div id="summary" style="margin-top: 4px;"><strong>Total Changes:</strong> Loading...</div>
             </div>
-            <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                __UNCHANGED_CHECKBOX_HTML__
                 <div>
-                    <label style="cursor: pointer; font-weight: bold; display: inline-flex; align-items: center; gap: 5px;">
-                        <input type="checkbox" id="showUnchanged" onchange="filterAndRenderTable()"> 顯示未變更的儲存格
-                    </label>
-                </div>
-                <div>
-                    <label for="sheetFilter" style="font-weight: bold; margin-right: 5px;">工作表篩選:</label>
-                    <select id="sheetFilter" class="btn" onchange="filterAndRenderTable()">
-                        <option value="">全部成功配對的工作表</option>
+                    <label for="sheetFilter" style="font-weight: bold; margin-right: 5px;">Sheet Filter:</label>
+                    <select id="sheetFilter" class="btn" onchange="onFilterChange()">
+                        <option value="">All Sheets</option>
                     </select>
                 </div>
-                <button class="btn" onclick="exportToCSV()">匯出 CSV</button>
                 <div>
-                    <button class="btn" onclick="setTheme('hacker')">💻 駭客</button>
-                    <button class="btn" onclick="setTheme('traditional')">📄 傳統</button>
+                    <label for="pageSizeSelect" style="font-weight: bold; margin-right: 5px;">Per Page:</label>
+                    <select id="pageSizeSelect" class="btn" onchange="onPageSizeChange()">
+                        <option value="500">500</option>
+                        <option value="1000">1000</option>
+                        <option value="2500" selected>2500</option>
+                        <option value="5000">5000</option>
+                    </select>
+                </div>
+                <button class="btn" onclick="exportToCSV()">Export CSV</button>
+                <div>
+                    <button class="btn" onclick="setTheme('hacker')">Hacker</button>
+                    <button class="btn" onclick="setTheme('traditional')">Traditional</button>
                 </div>
             </div>
         </div>
@@ -505,6 +572,7 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
         const sheetMeta = __SHEETMETA__;
         let currentSortCol = -1;
         let currentSortAsc = true;
+        let currentPage = 1;
 
         function setTheme(themeName) {
             if (themeName === 'traditional') {
@@ -518,42 +586,39 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             const container = document.getElementById('sheetStatusContainer');
             let html = '';
 
-            // 1. 成功配對
             html += `<div class="sheet-card">
-                <strong>✅ 成功配對 (可比對) [${sheetMeta.matched.length}]</strong>
+                <strong>Matched [${sheetMeta.matched.length}]</strong>
                 <div style="margin-top: 6px;">`;
             if (sheetMeta.matched.length > 0) {
                 sheetMeta.matched.forEach(s => {
-                    html += `<span class="sheet-badge badge-matched" onclick="selectSheetFromOverview('${s}')" title="點擊篩選此工作表">${escapeHtml(s)}</span>`;
+                    html += `<span class="sheet-badge badge-matched" onclick="selectSheetFromOverview('${s}')" title="Click to filter sheet">${escapeHtml(s)}</span>`;
                 });
             } else {
-                html += `<span class="meta-text" style="margin:0;">無共同工作表</span>`;
+                html += `<span class="meta-text" style="margin:0;">None</span>`;
             }
             html += `</div></div>`;
 
-            // 2. 僅舊版有
             html += `<div class="sheet-card" style="border-color: #ffaa00;">
-                <strong style="color: #ffaa00;">⚠️ 僅存在於舊版 [${sheetMeta.oldOnly.length}]</strong>
+                <strong style="color: #ffaa00;">Old Only [${sheetMeta.oldOnly.length}]</strong>
                 <div style="margin-top: 6px;">`;
             if (sheetMeta.oldOnly.length > 0) {
                 sheetMeta.oldOnly.forEach(s => {
-                    html += `<span class="sheet-badge badge-old" title="新版已刪除或更名">${escapeHtml(s)}</span>`;
+                    html += `<span class="sheet-badge badge-old" onclick="selectSheetFromOverview('${s}')" title="Click to inspect deleted sheet">${escapeHtml(s)}</span>`;
                 });
             } else {
-                html += `<span class="meta-text" style="margin:0;">無</span>`;
+                html += `<span class="meta-text" style="margin:0;">None</span>`;
             }
             html += `</div></div>`;
 
-            // 3. 僅新版有
             html += `<div class="sheet-card" style="border-color: #00ccff;">
-                <strong style="color: #00ccff;">✨ 僅存在於新版 [${sheetMeta.newOnly.length}]</strong>
+                <strong style="color: #00ccff;">New Only [${sheetMeta.newOnly.length}]</strong>
                 <div style="margin-top: 6px;">`;
             if (sheetMeta.newOnly.length > 0) {
                 sheetMeta.newOnly.forEach(s => {
-                    html += `<span class="sheet-badge badge-new" title="新版新增的工作表">${escapeHtml(s)}</span>`;
+                    html += `<span class="sheet-badge badge-new" onclick="selectSheetFromOverview('${s}')" title="Click to inspect added sheet">${escapeHtml(s)}</span>`;
                 });
             } else {
-                html += `<span class="meta-text" style="margin:0;">無</span>`;
+                html += `<span class="meta-text" style="margin:0;">None</span>`;
             }
             html += `</div></div>`;
 
@@ -563,19 +628,20 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
         function selectSheetFromOverview(sheetName) {
             const selectEl = document.getElementById('sheetFilter');
             selectEl.value = sheetName;
-            filterAndRenderTable();
+            onFilterChange();
             window.scrollTo({ top: document.getElementById('main-container').offsetTop - 50, behavior: 'smooth' });
         }
 
-        function computeDiffHtml(oldStr, newStr) {
+        function computeDiffHtml(oldStr, newStr, isOldOnly, isNewOnly) {
+            if (isOldOnly || isNewOnly) return '';
             if (!oldStr && !newStr) return '';
             if (oldStr === newStr) return '';
             if (!oldStr) return `<span class="diff-added">${escapeHtml(newStr)}</span>`;
-            if (!newStr) return `<span class="diff-deleted">${escapeHtml(oldStr)}</span>`;
-            return simpleDiff(oldStr, newStr);
+            if (!newStr) return `<span class="formula-deleted">${escapeHtml(oldStr)}</span>`;
+            return formulaDiff(oldStr, newStr);
         }
 
-        function simpleDiff(o, n) {
+        function formulaDiff(o, n) {
             let minLen = Math.min(o.length, n.length);
             let commonPrefixLen = 0;
             while(commonPrefixLen < minLen && o[commonPrefixLen] === n[commonPrefixLen]) commonPrefixLen++;
@@ -590,7 +656,7 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             let suffix = o.substring(o.length - commonSuffixLen);
 
             let result = escapeHtml(prefix);
-            if (oMid) result += `<span class="diff-deleted">${escapeHtml(oMid)}</span>`;
+            if (oMid) result += `<span class="formula-deleted">${escapeHtml(oMid)}</span>`;
             if (nMid) result += `<span class="diff-added">${escapeHtml(nMid)}</span>`;
             result += escapeHtml(suffix);
             return result;
@@ -610,7 +676,9 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
 
         function initSheetFilter() {
             const selectEl = document.getElementById('sheetFilter');
-            sheetMeta.matched.forEach(sheet => {
+            let allSheets = [...sheetMeta.matched, ...sheetMeta.oldOnly, ...sheetMeta.newOnly];
+            allSheets.sort();
+            allSheets.forEach(sheet => {
                 let opt = document.createElement('option');
                 opt.value = sheet;
                 opt.textContent = sheet;
@@ -619,7 +687,7 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
         }
 
         function updateSummary(filteredCount, totalCount) {
-            document.getElementById('summary').innerHTML = `<strong>顯示筆數:</strong> <b>${filteredCount}</b> / 總計 ${totalCount} 筆`;
+            document.getElementById('summary').innerHTML = `<strong>Displayed Count:</strong> <b>${filteredCount}</b> / Total ${totalCount} records`;
         }
 
         function sortTable(colIdx) {
@@ -629,7 +697,24 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
                 currentSortCol = colIdx;
                 currentSortAsc = true;
             }
+            currentPage = 1;
             filterAndRenderTable();
+        }
+
+        function onFilterChange() {
+            currentPage = 1;
+            filterAndRenderTable();
+        }
+
+        function onPageSizeChange() {
+            currentPage = 1;
+            filterAndRenderTable();
+        }
+
+        function changePage(targetPage) {
+            currentPage = targetPage;
+            filterAndRenderTable();
+            window.scrollTo({ top: document.getElementById('main-container').offsetTop - 50, behavior: 'smooth' });
         }
 
         function parseCellAddress(addr) {
@@ -644,21 +729,29 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
             return { colNum: colVal, rowNum: rowNum };
         }
 
+        let cachedFilteredChanges = null;
+
         function filterAndRenderTable() {
             const selectedSheet = document.getElementById('sheetFilter').value;
-            const showUnchanged = document.getElementById('showUnchanged').checked;
+            const showUnchangedCheckbox = document.getElementById('showUnchanged');
+            const showUnchanged = showUnchangedCheckbox ? showUnchangedCheckbox.checked : false;
             let changes = getAllChanges();
 
-            let filtered = changes.filter(c => {
+            cachedFilteredChanges = changes.filter(c => {
                 if (selectedSheet && c.sheet !== selectedSheet) return false;
-                if (!showUnchanged && !c.hasDiff) return false;
+                
+                if (!showUnchanged) {
+                    if (!c.hasDiff || c.isOldOnly || c.isNewOnly) {
+                        return false;
+                    }
+                }
                 return true;
             });
 
-            updateSummary(filtered.length, changes.length);
+            updateSummary(cachedFilteredChanges.length, changes.length);
 
             if (currentSortCol !== -1) {
-                filtered.sort((a, b) => {
+                cachedFilteredChanges.sort((a, b) => {
                     let valA, valB;
                     if (currentSortCol === 0) { valA = a.sheet; valB = b.sheet; }
                     else if (currentSortCol === 1) {
@@ -685,52 +778,135 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
                 });
             }
 
+            const pageSize = parseInt(document.getElementById('pageSizeSelect').value, 10);
+            const totalPages = Math.ceil(cachedFilteredChanges.length / pageSize) || 1;
+            if (currentPage > totalPages) currentPage = totalPages;
+            if (currentPage < 1) currentPage = 1;
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = startIndex + pageSize;
+            const pageData = cachedFilteredChanges.slice(startIndex, endIndex);
+
             const container = document.getElementById('main-container');
-            if (filtered.length === 0) {
-                container.innerHTML = '<div class="section-box"><p>沒有符合條件的資料。</p></div>';
+            if (cachedFilteredChanges.length === 0) {
+                container.innerHTML = '<div class="section-box"><p>No records matching the criteria. (Make sure "Show Unchanged & Unpaired" is enabled to view unchanged or unpaired sheets)</p></div>';
                 return;
             }
 
-            let html = '<div class="section-box"><table><thead><tr>';
-            const headers = ["工作表", "位置", "原始值", "變更後值", "值差異", "原始公式", "變更後公式", "公式差異比較"];
+            let html = '<div class="section-box"><table id="diffTable"><thead><tr>';
+            const headers = ["Sheet", "Address", "Old Value", "New Value", "Difference", "Old Formula", "New Formula", "Formula Comparison"];
             headers.forEach((h, idx) => {
                 let sortIndicator = (currentSortCol === idx) ? (currentSortAsc ? " ▲" : " ▼") : "";
-                html += `<th onclick="sortTable(${idx})">${h}${sortIndicator}</th>`;
+                html += `<th onclick="handleHeaderClick(event, ${idx})">${h}${sortIndicator}<div class="resizer" onmousedown="initResize(event, ${idx})"></div></th>`;
             });
             html += `</tr></thead><tbody>`;
             
-            filtered.forEach(c => {
-                let formulaDiffHtml = computeDiffHtml(c.oldFormula, c.newFormula);
+            pageData.forEach(c => {
+                let formulaDiffHtml = computeDiffHtml(c.oldFormula, c.newFormula, c.isOldOnly, c.isNewOnly);
+                
+                let oldValHtml = escapeHtml(c.oldVal);
+                let newValHtml = escapeHtml(c.newVal);
+                let diffValHtml = c.valDiff;
+                let oldFormulaHtml = escapeHtml(c.oldFormula);
+                let newFormulaHtml = escapeHtml(c.newFormula);
+
+                if (c.isOldOnly) {
+                    oldValHtml = escapeHtml(c.oldVal);
+                    newValHtml = '';
+                    diffValHtml = '';
+                    oldFormulaHtml = escapeHtml(c.oldFormula);
+                    newFormulaHtml = '';
+                } else if (c.isNewOnly) {
+                    oldValHtml = '';
+                    newValHtml = escapeHtml(c.newVal);
+                    diffValHtml = '';
+                    oldFormulaHtml = '';
+                    newFormulaHtml = escapeHtml(c.newFormula);
+                } else if (c.hasDiff) {
+                    newValHtml = `<span class="diff-added">${escapeHtml(c.newVal)}</span>`;
+                }
+
                 html += `<tr>`;
-                html += `<td>${escapeHtml(c.sheet)}</td>`;
-                html += `<td>${escapeHtml(c.address)}</td>`;
-                html += `<td>${escapeHtml(c.oldVal)}</td>`;
-                html += `<td>${c.hasDiff ? '<span class="diff-added">' + escapeHtml(c.newVal) + '</span>' : escapeHtml(c.newVal)}</td>`;
-                html += `<td>${escapeHtml(c.valDiff)}</td>`;
-                html += `<td>${escapeHtml(c.oldFormula)}</td>`;
-                html += `<td>${escapeHtml(c.newFormula)}</td>`;
-                html += `<td>${formulaDiffHtml}</td>`;
+                html += `<td>${escapeHtml(c.sheet)}<div class="resizer" onmousedown="initResize(event, 0)"></div></td>`;
+                html += `<td>${escapeHtml(c.address)}<div class="resizer" onmousedown="initResize(event, 1)"></div></td>`;
+                html += `<td>${oldValHtml}<div class="resizer" onmousedown="initResize(event, 2)"></div></td>`;
+                html += `<td>${newValHtml}<div class="resizer" onmousedown="initResize(event, 3)"></div></td>`;
+                html += `<td>${diffValHtml}<div class="resizer" onmousedown="initResize(event, 4)"></div></td>`;
+                html += `<td>${oldFormulaHtml}<div class="resizer" onmousedown="initResize(event, 5)"></div></td>`;
+                html += `<td>${newFormulaHtml}<div class="resizer" onmousedown="initResize(event, 6)"></div></td>`;
+                html += `<td>${formulaDiffHtml}<div class="resizer" onmousedown="initResize(event, 7)"></div></td>`;
                 html += `</tr>`;
             });
-            html += `</tbody></table></div>`;
+            html += `</tbody></table>`;
+
+            // Pagination Controls
+            html += `<div class="pagination-bar">
+                <div>Page <b>${currentPage}</b> of <b>${totalPages}</b> (Showing items ${startIndex + 1} - ${Math.min(endIndex, cachedFilteredChanges.length)})</div>
+                <div style="display: flex; gap: 5px;">
+                    <button class="btn" ${currentPage === 1 ? 'disabled style="opacity:0.5; cursor:not-allowed;"' : 'onclick="changePage(1)"'}>First</button>
+                    <button class="btn" ${currentPage === 1 ? 'disabled style="opacity:0.5; cursor:not-allowed;"' : 'onclick="changePage(' + (currentPage - 1) + ')"'}>Prev</button>
+                    <button class="btn" ${currentPage === totalPages ? 'disabled style="opacity:0.5; cursor:not-allowed;"' : 'onclick="changePage(' + (currentPage + 1) + ')"'}>Next</button>
+                    <button class="btn" ${currentPage === totalPages ? 'disabled style="opacity:0.5; cursor:not-allowed;"' : 'onclick="changePage(' + totalPages + ')"'}>Last</button>
+                </div>
+            </div>`;
+
+            html += `</div>`;
             container.innerHTML = html;
         }
 
-        function exportToCSV() {
-            const selectedSheet = document.getElementById('sheetFilter').value;
-            const showUnchanged = document.getElementById('showUnchanged').checked;
-            let changes = getAllChanges();
-            
-            if (selectedSheet) changes = changes.filter(c => c.sheet === selectedSheet);
-            if (!showUnchanged) changes = changes.filter(c => c.hasDiff);
+        let isResizing = false;
+        let targetTh = null;
+        let startX = 0;
+        let startWidth = 0;
 
-            let csvContent = "\uFEFF工作表,位置,原始值,變更後值,值差異,原始公式,變更後公式\r\n";
+        function initResize(e, colIdx) {
+            e.stopPropagation();
+            isResizing = true;
+            
+            const table = document.getElementById('diffTable');
+            targetTh = table.querySelectorAll('th')[colIdx];
+            
+            startX = e.clientX;
+            startWidth = targetTh.offsetWidth;
+            targetTh.classList.add('resizing');
+
+            document.addEventListener('mousemove', doResize);
+            document.addEventListener('mouseup', stopResize);
+        }
+
+        function doResize(e) {
+            if (!isResizing || !targetTh) return;
+            let widthDiff = e.clientX - startX;
+            let newWidth = Math.max(50, startWidth + widthDiff);
+            targetTh.style.width = newWidth + 'px';
+        }
+
+        function stopResize() {
+            if (isResizing && targetTh) {
+                targetTh.classList.remove('resizing');
+            }
+            isResizing = false;
+            targetTh = null;
+            document.removeEventListener('mousemove', doResize);
+            document.removeEventListener('mouseup', stopResize);
+        }
+
+        function handleHeaderClick(event, idx) {
+            if (event.target.classList.contains('resizer')) return;
+            sortTable(idx);
+        }
+
+        function exportToCSV() {
+            let changes = cachedFilteredChanges || getAllChanges();
+
+            let csvContent = "\uFEFFSheet,Address,Old Value,New Value,Difference,Old Formula,New Formula\r\n";
             changes.forEach(c => {
+                let cleanDiff = c.valDiff ? c.valDiff.replace(/<\/?[^>]+(>|$)/g, "") : "";
                 let row = [
                     c.sheet, c.address,
                     `"${c.oldVal.replace(/"/g, '""')}"`,
                     `"${c.newVal.replace(/"/g, '""')}"`,
-                    `"${c.valDiff.replace(/"/g, '""')}"`,
+                    `"${cleanDiff.replace(/"/g, '""')}"`,
                     `"${c.oldFormula.replace(/"/g, '""')}"`,
                     `"${c.newFormula.replace(/"/g, '""')}"`
                 ];
@@ -765,7 +941,8 @@ def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
                                 .replace('__NEW_MOD__', new_mod) \
                                 .replace('__TIMESTAMP__', timestamp) \
                                 .replace('__JSONDATA__', json_data) \
-                                .replace('__SHEETMETA__', sheet_meta_json)
+                                .replace('__SHEETMETA__', sheet_meta_json) \
+                                .replace('__UNCHANGED_CHECKBOX_HTML__', unchanged_checkbox_html)
     return html_content
 
 if __name__ == "__main__":
@@ -783,6 +960,6 @@ if __name__ == "__main__":
         old_file_path, 
         new_file_path,
         output_dir=os.path.join(DEFAULT_LOG_FOLDER, 'diff_reports'),
-        include_unchanged_cells=False
+        include_unchanged_cells=True
     )
-    print(f"測試成功！請打開 HTML 報告：\n{report_path}")
+    print(f"Test successful! Please open the HTML report:\n{report_path}")
