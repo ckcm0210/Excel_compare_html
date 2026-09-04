@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Excel 檔案變更歷程報告 - 具備全方位外部參照路徑還原、清理與差異對比功能（已修正雙引號包覆問題）
+Excel 檔案變更歷程報告 - 具備 Worksheet 配對狀態概覽與全方位外部參照路徑還原功能
 """
 import os
 import json
@@ -39,40 +39,28 @@ def get_excel_metadata(file_path):
     return author, last_modified_date
 
 def clean_target_path(raw_target):
-    """
-    Data Cleasing: 將 Excel 內部雜亂的路徑清洗成乾淨的絕對路徑
-    """
     if not raw_target:
         return ""
-    
     cleaned = urllib.parse.unquote(raw_target)
-    
     for prefix in ['file:///', 'file://', 'file:/']:
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):]
             break
-            
     if re.match(r'^/[A-Za-z]:', cleaned):
         cleaned = cleaned[1:]
-        
     cleaned = cleaned.replace('/', '\\')
     return cleaned.strip()
 
 def extract_external_refs(file_path):
-    """
-    精確版：透過 externalLinks/_rels/externalLinkX.xml.rels 挖出真正指向外部檔案的絕對路徑
-    """
     ref_map = {}
     file_path = file_path.strip('"')
     
     if not os.path.exists(file_path):
-        print(f"[Warning] 檔案不存在: {file_path}")
         return ref_map
 
     try:
         with zipfile.ZipFile(file_path, 'r') as z:
             namelist = z.namelist()
-            
             rels_path = 'xl/_rels/workbook.xml.rels'
             ext_target_map = {} 
             
@@ -87,8 +75,7 @@ def extract_external_refs(file_path):
                     if 'externalLink' in type_str or 'externalLinks' in target:
                         match_id = re.search(r'externalLink(\d+)\.xml', target)
                         if match_id:
-                            idx = int(match_id.group(1))
-                            ext_target_map[idx] = target
+                            ext_target_map[int(match_id.group(1))] = target
 
             for idx, link_target in ext_target_map.items():
                 link_target_clean = link_target.lstrip('/')
@@ -107,48 +94,25 @@ def extract_external_refs(file_path):
                             if target:
                                 real_file_path = clean_target_path(target)
                                 break
-                    except Exception as e:
-                        print(f"[Debug] 讀取 {rels_file_path} 失敗: {e}")
-                
-                if not real_file_path:
-                    full_link_path = 'xl/' + link_target_clean
-                    if full_link_path in namelist:
-                        try:
-                            content = z.read(full_link_path)
-                            sub_root = ET.fromstring(content)
-                            for elem in sub_root.iter():
-                                target = elem.get('{http://schemas.openxmlformats.org/package/2006/relationships}Target') or elem.get('Target')
-                                if target and ('file://' in target or ':' in target or '/' in target or '.xls' in target):
-                                    real_file_path = clean_target_path(target)
-                                    break
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
                 
                 if real_file_path:
                     ref_map[idx] = real_file_path
-
-        print(f"[Info] 成功解析 {os.path.basename(file_path)} 的外部參照對應表 (Ref Map): {ref_map}")
-    except Exception as e:
-        print(f"[Warning] 解析外部參照失敗 ({file_path}): {e}")
+    except Exception:
+        pass
         
     return ref_map
 
 def pretty_formula(formula, ref_map):
-    """
-    將公式內的 [1]、[80] 轉為 Excel 標準格式: 'X:\path\[File.xlsx]worksheet'!A1
-    並徹底解決 ='' 與頭尾雙引號被夾擊、以及工作表附近引號殘留的問題。
-    """
     if not formula:
         return ""
-    
     formula = str(formula).strip()
-    
     while formula.startswith('=='):
         formula = '=' + formula[2:]
     if not formula.startswith('='):
         formula = '=' + formula
 
-    # 預先處理形如 =''[1]worksheet''! 被雙引號整個包覆的特殊結構
     formula = re.sub(r"=''\[(\d+)\]([^!]+)''!", r"[\1]\2!", formula)
 
     def replace_with_sheet(match):
@@ -175,11 +139,7 @@ def pretty_formula(formula, ref_map):
         return match.group(0)
         
     formula = re.sub(r'\[(\d+)\]', replace_general, formula)
-    
-    formula = formula.replace("=''", "='")
-    formula = formula.replace("''!", "'!")
-    formula = formula.replace("''", "'")
-    
+    formula = formula.replace("=''", "='").replace("''!", "'!").replace("''", "'")
     return formula
 
 def excel_to_dict(file_path):
@@ -204,8 +164,7 @@ def excel_to_dict(file_path):
                     form_cell = sheet_f.cell(row=row_idx, column=col_idx)
                     formula = ""
                     if form_cell.value is not None and str(form_cell.value).startswith('='):
-                        raw_formula = str(form_cell.value)
-                        formula = pretty_formula(raw_formula, ref_map)
+                        formula = pretty_formula(str(form_cell.value), ref_map)
                     
                     sheet_data[coordinate] = {
                         "value": val,
@@ -223,7 +182,21 @@ def generate_diff_report(old_data, new_data, old_file_path, new_file_path, outpu
     os.makedirs(output_dir, exist_ok=True)
     
     diff_data = prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_unchanged_cells=include_unchanged_cells)
-    html_content = generate_html_content(diff_data, old_file_path, new_file_path)
+    
+    # 提取 Worksheet 配對狀態數據
+    old_sheets = set(old_data.keys())
+    new_sheets = set(new_data.keys())
+    matched_sheets = sorted(list(old_sheets & new_sheets))
+    old_only_sheets = sorted(list(old_sheets - new_sheets))
+    new_only_sheets = sorted(list(new_sheets - old_sheets))
+    
+    sheet_meta = {
+        "matched": matched_sheets,
+        "oldOnly": old_only_sheets,
+        "newOnly": new_only_sheets
+    }
+    
+    html_content = generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     new_filename = os.path.basename(new_file_path.strip('"'))
@@ -238,7 +211,7 @@ def generate_diff_report(old_data, new_data, old_file_path, new_file_path, outpu
     return output_path
 
 def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_unchanged_cells=False):
-    all_sheets = set(old_data.keys()) | set(new_data.keys())
+    all_sheets = set(old_data.keys()) & set(new_data.keys()) # 只對比共同擁有的 worksheets 避免 KeyError
     change_items = []
     
     for sheet_name in all_sheets:
@@ -263,12 +236,9 @@ def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_
             val_diff_str = ""
             try:
                 if str(old_val).strip() == "" and str(new_val).strip() != "":
-                    f_new = float(new_val)
-                    val_diff_str = str(f_new)
+                    val_diff_str = str(float(new_val))
                 elif str(old_val) != "" and str(new_val) != "":
-                    f_old = float(old_val)
-                    f_new = float(new_val)
-                    diff_val = f_new - f_old
+                    diff_val = float(new_val) - float(old_val)
                     if diff_val != 0:
                         val_diff_str = str(diff_val)
             except (ValueError, TypeError):
@@ -287,7 +257,6 @@ def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_
             })
                 
     timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
     events = [{
         "eventIndex": 1,
         "timestamp": timestamp_str,
@@ -301,8 +270,9 @@ def prepare_diff_data(old_data, new_data, old_file_path, new_file_path, include_
     }
     return [file_entry]
 
-def generate_html_content(diff_data, old_file_path, new_file_path):
+def generate_html_content(diff_data, sheet_meta, old_file_path, new_file_path):
     json_data = json.dumps(diff_data, ensure_ascii=False).replace("</script>", "<\\/script>")
+    sheet_meta_json = json.dumps(sheet_meta, ensure_ascii=False)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
     old_file_path = old_file_path.strip('"')
@@ -367,7 +337,7 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
             padding: 0 10px;
             transition: background 0.3s, color 0.3s;
         }
-        h1, h3, h4 { color: var(--text-color); }
+        h1, h3, h4 { color: var(--text-color); margin-top: 0; }
         .file-info, .section-box {
             background-color: var(--bg-color);
             border: 1px solid var(--border-color);
@@ -402,6 +372,39 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
             background-color: var(--btn-hover-bg);
             color: var(--btn-hover-color);
         }
+
+        /* Worksheet 配對狀態概覽專用樣式 */
+        .sheet-status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 15px;
+            margin-top: 10px;
+        }
+        .sheet-card {
+            border: 1px dashed var(--border-color);
+            padding: 12px;
+            background: var(--header-bg);
+            border-radius: 4px;
+        }
+        .sheet-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            margin: 3px 3px 3px 0;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+        .sheet-badge:hover { transform: scale(1.05); }
+        .badge-matched { background-color: #003300; color: #00ff00; border: 1px solid #00ff00; }
+        .badge-old { background-color: #331100; color: #ffaa00; border: 1px solid #ffaa00; }
+        .badge-new { background-color: #001133; color: #00ccff; border: 1px solid #00ccff; }
+
+        [data-theme="traditional"] .badge-matched { background-color: #d4edda; color: #155724; border-color: #c3e6cb; }
+        [data-theme="traditional"] .badge-old { background-color: #fff3cd; color: #856404; border-color: #ffeeba; }
+        [data-theme="traditional"] .badge-new { background-color: #cce5ff; color: #004085; border-color: #b8daff; }
+
         table {
             width: 100%;
             border-collapse: collapse;
@@ -432,17 +435,8 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
         }
         th:nth-child(1), td:nth-child(1) { min-width: 160px; }
         th:nth-child(2), td:nth-child(2) { white-space: nowrap; min-width: 70px; }
-        .diff-added { 
-            background-color: var(--added-bg); 
-            color: var(--added-color); 
-            padding: 1px 2px;
-        }
-        .diff-deleted { 
-            background-color: var(--deleted-bg); 
-            color: var(--deleted-color); 
-            text-decoration: line-through;
-            padding: 1px 2px;
-        }
+        .diff-added { background-color: var(--added-bg); color: var(--added-color); padding: 1px 2px; }
+        .diff-deleted { background-color: var(--deleted-bg); color: var(--deleted-color); text-decoration: line-through; padding: 1px 2px; }
         .header-row {
             display: flex;
             justify-content: space-between;
@@ -465,8 +459,20 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
             <strong>📂 新版檔案 (New):</strong> <a href="__NEWURL__" target="_blank" class="file-link">__NEWFILEPATH__</a>
             <div class="meta-text">👤 上次存檔者: __NEW_AUTHOR__ &nbsp;|&nbsp; 🕒 最後修改: __NEW_MOD__</div>
         </div>
+    </div>
+
+    <!-- 🌟 工作表配對狀態概覽區塊 -->
+    <div class="section-box" style="border-left: 4px solid var(--border-color);">
+        <h3>📌 工作表 (Worksheet) 配對狀態概覽</h3>
+        <p class="meta-text" style="margin-bottom: 8px;">系統會自動配對雙方皆存在的工作表進行比較；名稱不相符或僅單邊存在的表將無法進行儲存格差異對比。</p>
         
-        <div style="margin-top: 8px; border-top: 1px dashed var(--border-color); padding-top: 8px;" class="header-row">
+        <div class="sheet-status-grid" id="sheetStatusContainer">
+            <!-- 動態填入 -->
+        </div>
+    </div>
+
+    <div class="file-info">
+        <div style="border-top: 1px dashed var(--border-color); padding-top: 8px;" class="header-row">
             <div>
                 <strong>⏱️ 報告生成時間:</strong> <span>__TIMESTAMP__</span><br>
                 <div id="summary" style="margin-top: 4px;"><strong>總變更數:</strong> 載入中...</div>
@@ -478,9 +484,9 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
                     </label>
                 </div>
                 <div>
-                    <label for="sheetFilter" style="font-weight: bold; margin-right: 5px;">工作表:</label>
+                    <label for="sheetFilter" style="font-weight: bold; margin-right: 5px;">工作表篩選:</label>
                     <select id="sheetFilter" class="btn" onchange="filterAndRenderTable()">
-                        <option value="">全部工作表</option>
+                        <option value="">全部成功配對的工作表</option>
                     </select>
                 </div>
                 <button class="btn" onclick="exportToCSV()">匯出 CSV</button>
@@ -496,6 +502,7 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
 
     <script>
         const timelineData = __JSONDATA__;
+        const sheetMeta = __SHEETMETA__;
         let currentSortCol = -1;
         let currentSortAsc = true;
 
@@ -507,6 +514,59 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
             }
         }
 
+        function renderSheetStatusOverview() {
+            const container = document.getElementById('sheetStatusContainer');
+            let html = '';
+
+            // 1. 成功配對
+            html += `<div class="sheet-card">
+                <strong>✅ 成功配對 (可比對) [${sheetMeta.matched.length}]</strong>
+                <div style="margin-top: 6px;">`;
+            if (sheetMeta.matched.length > 0) {
+                sheetMeta.matched.forEach(s => {
+                    html += `<span class="sheet-badge badge-matched" onclick="selectSheetFromOverview('${s}')" title="點擊篩選此工作表">${escapeHtml(s)}</span>`;
+                });
+            } else {
+                html += `<span class="meta-text" style="margin:0;">無共同工作表</span>`;
+            }
+            html += `</div></div>`;
+
+            // 2. 僅舊版有
+            html += `<div class="sheet-card" style="border-color: #ffaa00;">
+                <strong style="color: #ffaa00;">⚠️ 僅存在於舊版 [${sheetMeta.oldOnly.length}]</strong>
+                <div style="margin-top: 6px;">`;
+            if (sheetMeta.oldOnly.length > 0) {
+                sheetMeta.oldOnly.forEach(s => {
+                    html += `<span class="sheet-badge badge-old" title="新版已刪除或更名">${escapeHtml(s)}</span>`;
+                });
+            } else {
+                html += `<span class="meta-text" style="margin:0;">無</span>`;
+            }
+            html += `</div></div>`;
+
+            // 3. 僅新版有
+            html += `<div class="sheet-card" style="border-color: #00ccff;">
+                <strong style="color: #00ccff;">✨ 僅存在於新版 [${sheetMeta.newOnly.length}]</strong>
+                <div style="margin-top: 6px;">`;
+            if (sheetMeta.newOnly.length > 0) {
+                sheetMeta.newOnly.forEach(s => {
+                    html += `<span class="sheet-badge badge-new" title="新版新增的工作表">${escapeHtml(s)}</span>`;
+                });
+            } else {
+                html += `<span class="meta-text" style="margin:0;">無</span>`;
+            }
+            html += `</div></div>`;
+
+            container.innerHTML = html;
+        }
+
+        function selectSheetFromOverview(sheetName) {
+            const selectEl = document.getElementById('sheetFilter');
+            selectEl.value = sheetName;
+            filterAndRenderTable();
+            window.scrollTo({ top: document.getElementById('main-container').offsetTop - 50, behavior: 'smooth' });
+        }
+
         function computeDiffHtml(oldStr, newStr) {
             if (!oldStr && !newStr) return '';
             if (oldStr === newStr) return '';
@@ -516,52 +576,41 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
         }
 
         function simpleDiff(o, n) {
-            let result = '';
             let minLen = Math.min(o.length, n.length);
             let commonPrefixLen = 0;
-            while(commonPrefixLen < minLen && o[commonPrefixLen] === n[commonPrefixLen]) {
-                commonPrefixLen++;
-            }
+            while(commonPrefixLen < minLen && o[commonPrefixLen] === n[commonPrefixLen]) commonPrefixLen++;
             
             let commonSuffixLen = 0;
             while(commonSuffixLen < (minLen - commonPrefixLen) && 
-                  o[o.length - 1 - commonSuffixLen] === n[n.length - 1 - commonSuffixLen]) {
-                commonSuffixLen++;
-            }
+                  o[o.length - 1 - commonSuffixLen] === n[n.length - 1 - commonSuffixLen]) commonSuffixLen++;
 
             let prefix = o.substring(0, commonPrefixLen);
             let oMid = o.substring(commonPrefixLen, o.length - commonSuffixLen);
             let nMid = n.substring(commonPrefixLen, n.length - commonSuffixLen);
             let suffix = o.substring(o.length - commonSuffixLen);
 
-            result += escapeHtml(prefix);
+            let result = escapeHtml(prefix);
             if (oMid) result += `<span class="diff-deleted">${escapeHtml(oMid)}</span>`;
             if (nMid) result += `<span class="diff-added">${escapeHtml(nMid)}</span>`;
             result += escapeHtml(suffix);
-            
             return result;
         }
 
         function escapeHtml(text) {
-            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
         }
 
         function getAllChanges() {
             let changes = [];
             if (timelineData && timelineData.length > 0 && timelineData[0].events) {
-                timelineData[0].events.forEach(ev => {
-                    changes = changes.concat(ev.changes);
-                });
+                timelineData[0].events.forEach(ev => { changes = changes.concat(ev.changes); });
             }
             return changes;
         }
 
         function initSheetFilter() {
-            const changes = getAllChanges();
-            const sheets = [...new Set(changes.map(c => c.sheet))].sort();
             const selectEl = document.getElementById('sheetFilter');
-            
-            sheets.forEach(sheet => {
+            sheetMeta.matched.forEach(sheet => {
                 let opt = document.createElement('option');
                 opt.value = sheet;
                 opt.textContent = sheet;
@@ -570,8 +619,7 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
         }
 
         function updateSummary(filteredCount, totalCount) {
-            const summaryEl = document.getElementById('summary');
-            summaryEl.innerHTML = `<strong>顯示筆數:</strong> <b>${filteredCount}</b> / 總計 ${totalCount} 筆`;
+            document.getElementById('summary').innerHTML = `<strong>顯示筆數:</strong> <b>${filteredCount}</b> / 總計 ${totalCount} 筆`;
         }
 
         function sortTable(colIdx) {
@@ -616,11 +664,8 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
                     else if (currentSortCol === 1) {
                         let parsedA = parseCellAddress(a.address);
                         let parsedB = parseCellAddress(b.address);
-                        if (parsedA.rowNum !== parsedB.rowNum) {
-                            valA = parsedA.rowNum; valB = parsedB.rowNum;
-                        } else {
-                            valA = parsedA.colNum; valB = parsedB.colNum;
-                        }
+                        if (parsedA.rowNum !== parsedB.rowNum) { valA = parsedA.rowNum; valB = parsedB.rowNum; }
+                        else { valA = parsedA.colNum; valB = parsedB.colNum; }
                     }
                     else if (currentSortCol === 2) { valA = a.oldVal; valB = b.oldVal; }
                     else if (currentSortCol === 3) { valA = a.newVal; valB = b.newVal; }
@@ -641,27 +686,21 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
             }
 
             const container = document.getElementById('main-container');
-            let html = '<div class="section-box">';
-            
             if (filtered.length === 0) {
                 container.innerHTML = '<div class="section-box"><p>沒有符合條件的資料。</p></div>';
                 return;
             }
 
+            let html = '<div class="section-box"><table><thead><tr>';
             const headers = ["工作表", "位置", "原始值", "變更後值", "值差異", "原始公式", "變更後公式", "公式差異比較"];
-            html += `<table><thead><tr>`;
             headers.forEach((h, idx) => {
-                let sortIndicator = "";
-                if (currentSortCol === idx) {
-                    sortIndicator = currentSortAsc ? " ▲" : " ▼";
-                }
+                let sortIndicator = (currentSortCol === idx) ? (currentSortAsc ? " ▲" : " ▼") : "";
                 html += `<th onclick="sortTable(${idx})">${h}${sortIndicator}</th>`;
             });
             html += `</tr></thead><tbody>`;
             
             filtered.forEach(c => {
                 let formulaDiffHtml = computeDiffHtml(c.oldFormula, c.newFormula);
-                
                 html += `<tr>`;
                 html += `<td>${escapeHtml(c.sheet)}</td>`;
                 html += `<td>${escapeHtml(c.address)}</td>`;
@@ -682,18 +721,13 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
             const showUnchanged = document.getElementById('showUnchanged').checked;
             let changes = getAllChanges();
             
-            if (selectedSheet) {
-                changes = changes.filter(c => c.sheet === selectedSheet);
-            }
-            if (!showUnchanged) {
-                changes = changes.filter(c => c.hasDiff);
-            }
+            if (selectedSheet) changes = changes.filter(c => c.sheet === selectedSheet);
+            if (!showUnchanged) changes = changes.filter(c => c.hasDiff);
 
             let csvContent = "\uFEFF工作表,位置,原始值,變更後值,值差異,原始公式,變更後公式\r\n";
             changes.forEach(c => {
                 let row = [
-                    c.sheet,
-                    c.address,
+                    c.sheet, c.address,
                     `"${c.oldVal.replace(/"/g, '""')}"`,
                     `"${c.newVal.replace(/"/g, '""')}"`,
                     `"${c.valDiff.replace(/"/g, '""')}"`,
@@ -706,13 +740,14 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
             const link = document.createElement("a");
             link.href = URL.createObjectURL(blob);
-            link.setAttribute("download", "excel_multiauthor_export.csv");
+            link.setAttribute("download", "excel_sheet_compare_export.csv");
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);
         }
 
         window.onload = function() {
+            renderSheetStatusOverview();
             initSheetFilter();
             filterAndRenderTable();
         };
@@ -720,20 +755,17 @@ def generate_html_content(diff_data, old_file_path, new_file_path):
 </body>
 </html>"""
 
-    html_content = html_template
-    html_content = html_content.replace('__OLDFILEPATH__', old_file_path)
-    html_content = html_content.replace('__NEWFILEPATH__', new_file_path)
-    html_content = html_content.replace('__OLDURL__', old_url)
-    html_content = html_content.replace('__NEWURL__', new_url)
-    
-    html_content = html_content.replace('__OLD_AUTHOR__', old_author)
-    html_content = html_content.replace('__OLD_MOD__', old_mod)
-    html_content = html_content.replace('__NEW_AUTHOR__', new_author)
-    html_content = html_content.replace('__NEW_MOD__', new_mod)
-    
-    html_content = html_content.replace('__TIMESTAMP__', timestamp)
-    html_content = html_content.replace('__JSONDATA__', json_data)
-    
+    html_content = html_template.replace('__OLDFILEPATH__', old_file_path) \
+                                .replace('__NEWFILEPATH__', new_file_path) \
+                                .replace('__OLDURL__', old_url) \
+                                .replace('__NEWURL__', new_url) \
+                                .replace('__OLD_AUTHOR__', old_author) \
+                                .replace('__OLD_MOD__', old_mod) \
+                                .replace('__NEW_AUTHOR__', new_author) \
+                                .replace('__NEW_MOD__', new_mod) \
+                                .replace('__TIMESTAMP__', timestamp) \
+                                .replace('__JSONDATA__', json_data) \
+                                .replace('__SHEETMETA__', sheet_meta_json)
     return html_content
 
 if __name__ == "__main__":
